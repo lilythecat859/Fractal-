@@ -39,10 +39,14 @@ func main() {
 	if err != nil {
 		log.Fatalf("bad jwt-key: %v", err)
 	}
-	db, err := clickhouse.New(*dbDSN)
+		db, err := clickhouse.New(*dbDSN)
 	if err != nil {
 		log.Fatalf("db: %v", err)
 	}
+	if err := db.Migrate(context.Background()); err != nil {
+		log.Fatalf("migrate: %v", err)
+	}
+
 	srv := api.NewServer(db, key)
 	srv.Apply(api.TLS(*certFile, *keyFile))
 
