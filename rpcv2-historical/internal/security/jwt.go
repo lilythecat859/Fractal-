@@ -2,9 +2,12 @@
 package security
 
 import (
+	"context"
 	"crypto/ed25519"
 	"encoding/base64"
 	"errors"
+	"fmt"
+	"sync"
 	"time"
 
 	"github.com/golang-jwt/jwt/v5"
@@ -14,22 +17,39 @@ type Signer interface {
 	Sign(method string) (string, error)
 }
 
-type edSigner struct {
-	priv ed25519.PrivateKey
+type Validator interface {
+	Validate(bearer string) (scope uint32, err error)
 }
 
-func ParseEdKey(b64 string) (Signer, error) {
+// Ed25519 backed
+type edKey struct {
+	mu sync.RWMutex
+	priv ed25519.PrivateKey
+	pub  ed25519.PublicKey
+}
+
+func NewEdKey() (*edKey, error) {
+	pub, priv, err := ed25519.GenerateKey(nil)
+	if err != nil {
+		return nil, err
+	}
+	return &edKey{priv: priv, pub: pub}, nil
+}
+
+func ParseEdKey(b64 string) (*edKey, error) {
 	b, err := base64.StdEncoding.DecodeString(b64)
 	if err != nil {
 		return nil, err
 	}
 	if len(b) != ed25519.PrivateKeySize {
-		return nil, errors.New("bad size")
+		return nil, errors.New("bad private key size")
 	}
-	return &edSigner{priv: ed25519.PrivateKey(b)}, nil
+	k := &edKey{priv: ed25519.PrivateKey(b)}
+	k.pub = k.priv.Public().(ed25519.PublicKey)
+	return k, nil
 }
 
-func (s *edSigner) Sign(method string) (string, error) {
+func (k *edKey) Sign(method string) (string, error) {
 	now := time.Now()
 	claims := jwt.RegisteredClaims{
 		ExpiresAt: jwt.NewNumericDate(now.Add(5 * time.Minute)),
@@ -37,10 +57,53 @@ func (s *edSigner) Sign(method string) (string, error) {
 		Subject:   method,
 	}
 	token := jwt.NewWithClaims(jwt.SigningMethodEdDSA, claims)
-	return token.SignedString(s.priv)
+	return token.SignedString(k.priv)
 }
 
-func CanCall(header http.Header, method string) bool {
-	// stub – verify JWT from Authorization header
-	return true
+func (k *edKey) Validate(bearer string) (uint32, error) {
+	k.mu.RLock()
+	pub := k.pub
+	k.mu.RUnlock()
+	token, err := jwt.Parse(bearer, func(t *jwt.Token) (interface{}, error) {
+		if _, ok := t.Method.(*jwt.SigningMethodEdDSA); !ok {
+			return nil, errors.New("bad algo")
+		}
+		return pub, nil
+	})
+	if err != nil {
+		return 0, err
+	}
+	if !token.Valid {
+		return 0, errors.New("invalid token")
+	}
+	// convert scopes
+	sub, err := token.Claims.GetSubject()
+	if err != nil {
+		return 0, err
+	}
+	return parseScope(sub), nil
+}
+
+func (k *edKey) Rotate() error {
+	k.mu.Lock()
+	defer k.mu.Unlock()
+	pub, priv, err := ed25519.GenerateKey(nil)
+	if err != nil {
+		return err
+	}
+	k.priv = priv
+	k.pub = pub
+	return nil
+}
+
+func parseScope(sub string) uint32 {
+	switch sub {
+	case "read":
+		return ScopeRead
+	case "write":
+		return ScopeWrite | ScopeRead
+	case "admin":
+		return ScopeRead | ScopeWrite | ScopeAdmin
+	}
+	return 0
 }
